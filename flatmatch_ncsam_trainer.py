@@ -49,6 +49,8 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
             'train/ncsam_noise_loss': 0.0,
             'train/ncsam_noise_norm': 0.0,
             'train/ncsam_selected_ratio': 0.0,
+            'train/ncsam_confidence': 0.0,
+            'train/ncsam_disagreement': 0.0,
             'train/ncsam_margin': 0.0,
             'train/ncsam_density': 0.0,
             'train/ncsam_balance': 0.0,
@@ -68,6 +70,10 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
             'ncsam_max_lambda': float(self.ncsam_cfg.MAX_LAMBDA),
             'ncsam_min_select_ratio': float(self.ncsam_cfg.MIN_SELECT_RATIO),
             'ncsam_select_ratio': float(self.ncsam_cfg.SELECT_RATIO),
+            'ncsam_confidence_power': float(self.ncsam_cfg.CONFIDENCE_POWER),
+            'ncsam_disagreement_power': float(self.ncsam_cfg.DISAGREEMENT_POWER),
+            'ncsam_min_disagreement': float(self.ncsam_cfg.MIN_DISAGREEMENT),
+            'ncsam_hard_disagreement_weight': float(self.ncsam_cfg.HARD_DISAGREEMENT_WEIGHT),
             'ncsam_margin_temperature': float(self.ncsam_cfg.MARGIN_TEMPERATURE),
             'ncsam_density_power': float(self.ncsam_cfg.DENSITY_POWER),
             'ncsam_min_density': float(self.ncsam_cfg.MIN_DENSITY),
@@ -126,31 +132,44 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
             float(self.ncsam_cfg.SELECT_RATIO),
         )
 
-    def __weighted_noise_loss__(self, logits_ulb_w, feats_ulb_w):
+    def __weighted_noise_loss__(self, logits_ulb_w, logits_ulb_s, feats_ulb_w):
         with torch.no_grad():
-            weights, targets, selected, stats = self.__noise_targets_and_weights__(
+            weights, selected, stats = self.__noise_weights__(
                 logits_ulb_w.detach(),
+                logits_ulb_s.detach(),
                 feats_ulb_w.detach(),
             )
 
-        per_sample_loss = F.cross_entropy(logits_ulb_w, targets, reduction='none')
+        probs_ulb_w = torch.softmax(logits_ulb_w.detach(), dim=-1)
+        per_sample_loss = F.kl_div(
+            F.log_softmax(logits_ulb_s, dim=-1),
+            probs_ulb_w,
+            reduction='none',
+        ).sum(dim=-1)
         selected_weights = weights[selected]
         selected_loss = per_sample_loss[selected]
         loss = (selected_loss * selected_weights).sum() / selected_weights.sum().clamp_min(1e-12)
         return loss, stats
 
-    def __noise_targets_and_weights__(self, logits_ulb_w, feats_ulb_w):
-        probs = torch.softmax(logits_ulb_w, dim=-1)
-        top2_probs, top2_idx = torch.topk(probs, k=2, dim=-1)
+    def __noise_weights__(self, logits_ulb_w, logits_ulb_s, feats_ulb_w):
+        probs_w = torch.softmax(logits_ulb_w, dim=-1)
+        probs_s = torch.softmax(logits_ulb_s, dim=-1)
+        top2_probs, top2_idx = torch.topk(probs_w, k=2, dim=-1)
         pseudo_targets = top2_idx[:, 0]
-        flipped_targets = top2_idx[:, 1]
         margins = top2_probs[:, 0] - top2_probs[:, 1]
+        confidence = top2_probs[:, 0]
 
+        low_confidence = (1.0 - confidence).clamp_min(0.0).pow(self.ncsam_cfg.CONFIDENCE_POWER)
         uncertainty = 1.0 / (1.0 + margins / max(self.ncsam_cfg.MARGIN_TEMPERATURE, 1e-6))
+        soft_disagreement = 0.5 * torch.abs(probs_w - probs_s).sum(dim=-1)
+        hard_disagreement = pseudo_targets.ne(torch.argmax(probs_s, dim=-1)).to(probs_w.dtype)
+        disagreement = soft_disagreement + self.ncsam_cfg.HARD_DISAGREEMENT_WEIGHT * hard_disagreement
+        disagreement = disagreement.clamp_min(self.ncsam_cfg.MIN_DISAGREEMENT)
+        disagreement = disagreement.pow(self.ncsam_cfg.DISAGREEMENT_POWER)
         density = self.__batch_density__(feats_ulb_w, pseudo_targets)
-        balance = self.__class_balance__(pseudo_targets, probs.shape[1])
+        balance = self.__class_balance__(pseudo_targets, probs_w.shape[1])
 
-        weights = uncertainty * density.pow(self.ncsam_cfg.DENSITY_POWER) * balance
+        weights = low_confidence * disagreement * uncertainty * density.pow(self.ncsam_cfg.DENSITY_POWER) * balance
         weights = weights / weights.mean().clamp_min(1e-12)
         weights = weights.clamp(max=self.ncsam_cfg.MAX_SAMPLE_WEIGHT)
 
@@ -162,11 +181,13 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
         stats = {
             'train/ncsam_select_ratio_target': select_ratio,
             'train/ncsam_selected_ratio': selected.float().mean().item(),
+            'train/ncsam_confidence': confidence[selected].mean().item(),
+            'train/ncsam_disagreement': disagreement[selected].mean().item(),
             'train/ncsam_margin': margins[selected].mean().item(),
             'train/ncsam_density': density[selected].mean().item(),
             'train/ncsam_balance': balance[selected].mean().item(),
         }
-        return weights.detach(), flipped_targets.detach(), selected.detach(), stats
+        return weights.detach(), selected.detach(), stats
 
     def __batch_density__(self, feats, pseudo_targets):
         feats = F.normalize(feats, dim=-1)
@@ -234,7 +255,7 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
         self.ncsam_stats = self.__empty_ncsam_stats__()
         return grad_w, eps_fm
 
-    def __build_compensated_perturbation__(self, loss_lb, logits_ulb_w, feats_ulb_w):
+    def __build_compensated_perturbation__(self, loss_lb, logits_ulb_w, logits_ulb_s, feats_ulb_w):
         params = list(self.net.model.parameters())
         lambda_t = self.__compensation_lambda__()
         grad_w = torch.autograd.grad(loss_lb, params, retain_graph=lambda_t > 0.0, allow_unused=True)
@@ -246,7 +267,7 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
         if lambda_t <= 0.0:
             return grad_w, eps_fm
 
-        noise_loss, stats = self.__weighted_noise_loss__(logits_ulb_w, feats_ulb_w)
+        noise_loss, stats = self.__weighted_noise_loss__(logits_ulb_w, logits_ulb_s, feats_ulb_w)
         grad_noise = torch.autograd.grad(noise_loss, params, allow_unused=True)
         eps_noise, noise_norm = self.__normalize_grads__(grad_noise, self.rho)
 
@@ -339,6 +360,7 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
                         self.grad_w, self.eps = self.__build_compensated_perturbation__(
                             loss_lb,
                             logits_ulb_w,
+                            logits_ulb_s,
                             feats_ulb_w,
                         )
 
@@ -436,7 +458,7 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
                     'sat': '%.4f' % log_dict['train/sat_loss'],
                     'mask': '%.3f' % log_dict['train/pseudo_accept'],
                     'lambda': '%.3f' % log_dict['train/ncsam_lambda'],
-                    'flip': '%.3f' % log_dict['train/ncsam_selected_ratio'],
+                    'noise': '%.3f' % log_dict['train/ncsam_selected_ratio'],
                     'phase': 'fm' if flatmatch_warmup else 'ncsam',
                     'best': '%.4f' % self.best_test_acc,
                 })
