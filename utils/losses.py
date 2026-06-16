@@ -32,6 +32,10 @@ class SelfAdaptiveFairnessLoss:
         
         # Take high confidence examples based on Eq 7 of the paper
         logits_ulb_s = logits_ulb_s[mask.bool()]
+        if logits_ulb_s.shape[0] == 0:
+            zero = p_t.new_tensor(0.0)
+            return zero, zero
+
         probs_ulb_s = torch.softmax(logits_ulb_s, dim=-1)
         max_idx_s = torch.argmax(probs_ulb_s, dim=-1)
         
@@ -97,4 +101,3 @@ class SelfAdaptiveThresholdLoss:
         loss = self.criterion(logits_ulb_s, max_idx_w, mask=mask)
 
         return loss, mask, tau_t, p_t, label_hist
-

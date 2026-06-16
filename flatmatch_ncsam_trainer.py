@@ -5,6 +5,7 @@ import time
 
 import torch
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 
 from trainer import FreeMatchTrainer
 from utils import disable_running_stats, enable_running_stats
@@ -221,6 +222,18 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
         scale = radius / perturb_norm.clamp_min(1e-12)
         return [p * scale if p is not None else None for p in perturbation]
 
+    def __use_flatmatch_warmup__(self):
+        if not self.ncsam_cfg.ENABLED:
+            return False
+        warmup_end = self.ncsam_cfg.START_ITER + self.ncsam_cfg.WARMUP_ITERS
+        return self.curr_iter < warmup_end
+
+    def __build_flatmatch_perturbation__(self, loss_lb):
+        grad_w = torch.autograd.grad(loss_lb, self.net.model.parameters(), allow_unused=True)
+        eps_fm, _ = self.__normalize_grads__(grad_w, self.rho)
+        self.ncsam_stats = self.__empty_ncsam_stats__()
+        return grad_w, eps_fm
+
     def __build_compensated_perturbation__(self, loss_lb, logits_ulb_w, feats_ulb_w):
         params = list(self.net.model.parameters())
         lambda_t = self.__compensation_lambda__()
@@ -282,129 +295,160 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
         batch_timer = _RunTimer(use_cuda_timer)
         run_timer = _RunTimer(use_cuda_timer)
         batch_timer.start()
+        progress = tqdm(
+            total=max(0, self.num_train_iters - self.curr_iter),
+            desc='FlatMatch+NCSAM',
+            dynamic_ncols=True,
+        )
 
-        for batch_lb, batch_ulb in zip(self.dm.train_lb_dl, self.dm.train_ulb_dl):
-            if self.curr_iter >= self.num_train_iters:
-                break
+        try:
+            for batch_lb, batch_ulb in zip(self.dm.train_lb_dl, self.dm.train_ulb_dl):
+                if self.curr_iter >= self.num_train_iters:
+                    break
 
-            fetch_time = batch_timer.stop()
-            run_timer.start()
+                fetch_time = batch_timer.stop()
+                run_timer.start()
 
-            img_lb_w, label_lb = batch_lb['img_w'], batch_lb['label']
-            img_ulb_w, img_ulb_s = batch_ulb['img_w'], batch_ulb['img_s']
+                img_lb_w, label_lb = batch_lb['img_w'], batch_lb['label']
+                img_ulb_w, img_ulb_s = batch_ulb['img_w'], batch_ulb['img_s']
 
-            img_lb_w, label_lb = img_lb_w.to(self.device), label_lb.to(self.device)
-            img_ulb_w, img_ulb_s = img_ulb_w.to(self.device), img_ulb_s.to(self.device)
+                img_lb_w, label_lb = img_lb_w.to(self.device), label_lb.to(self.device)
+                img_ulb_w, img_ulb_s = img_ulb_w.to(self.device), img_ulb_s.to(self.device)
 
-            num_lb = img_lb_w.shape[0]
-            num_ulb = img_ulb_w.shape[0]
-            assert num_ulb == img_ulb_s.shape[0]
+                num_lb = img_lb_w.shape[0]
+                num_ulb = img_ulb_w.shape[0]
+                assert num_ulb == img_ulb_s.shape[0]
 
-            img = torch.cat([img_lb_w, img_ulb_w, img_ulb_s])
-            params = list(self.net.model.parameters())
+                img = torch.cat([img_lb_w, img_ulb_w, img_ulb_s])
+                params = list(self.net.model.parameters())
+                flatmatch_warmup = self.__use_flatmatch_warmup__()
 
-            with self.amp():
-                enable_running_stats(self.net.model)
-                out = self.net(img)
-                feats = out['feats']
-                logits = out['logits']
-                logits_lb = logits[:num_lb]
-                logits_ulb_w, logits_ulb_s = logits[num_lb:].chunk(2)
-                feats_ulb_w = feats[num_lb:num_lb + num_ulb]
+                with self.amp():
+                    enable_running_stats(self.net.model)
+                    out = self.net(img)
+                    feats = out['feats']
+                    logits = out['logits']
+                    logits_lb = logits[:num_lb]
+                    logits_ulb_w, logits_ulb_s = logits[num_lb:].chunk(2)
+                    feats_ulb_w = feats[num_lb:num_lb + num_ulb]
 
-                loss_lb = self.ce_criterion(logits_lb, label_lb, reduction='mean')
-                self.grad_w, self.eps = self.__build_compensated_perturbation__(
-                    loss_lb,
-                    logits_ulb_w,
-                    feats_ulb_w,
-                )
+                    loss_lb = self.ce_criterion(logits_lb, label_lb, reduction='mean')
+                    if flatmatch_warmup:
+                        self.grad_w, self.eps = self.__build_flatmatch_perturbation__(loss_lb)
+                    else:
+                        self.grad_w, self.eps = self.__build_compensated_perturbation__(
+                            loss_lb,
+                            logits_ulb_w,
+                            feats_ulb_w,
+                        )
 
-            with torch.no_grad():
-                self.__add_perturbation__(params, self.eps)
-
-            disable_running_stats(self.net.model)
-
-            with self.amp():
-                out_hat = self.net(img)
-                logits_hat = out_hat['logits']
-                logits_lb_hat = logits_hat[:num_lb]
-                _, logits_ulb_s_hat = logits_hat[num_lb:].chunk(2)
-
-                loss_lb = self.ce_criterion(logits_lb_hat, label_lb, reduction='mean')
-                loss_sat, mask, self.tau_t, self.p_t, self.label_hist = self.sat_criterion(
-                    logits_ulb_w,
-                    logits_ulb_s_hat,
-                    self.tau_t,
-                    self.p_t,
-                    self.label_hist,
-                )
-                loss_saf, hist_p_ulb_s = self.saf_criterion(mask, logits_ulb_s_hat, self.p_t, self.label_hist)
-                loss = loss_lb + self.ulb_loss_ratio * loss_sat + self.ent_loss_ratio * loss_saf
-
-            if self.cfg.TRAINER.AMP_ENABLED:
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optim.optimizer)
                 with torch.no_grad():
-                    self.__remove_perturbation__(params, self.eps)
-                    self.__add_base_grads__(params, self.grad_w)
-                self.scaler.step(self.optim.optimizer)
-                self.scaler.update()
-            else:
-                loss.backward()
-                with torch.no_grad():
-                    self.__remove_perturbation__(params, self.eps)
-                    self.__add_base_grads__(params, self.grad_w)
-                self.optim.step()
+                    self.__add_perturbation__(params, self.eps)
 
-            self.sched.step()
-            self.net.update()
-            self.model.zero_grad()
+                disable_running_stats(self.net.model)
 
-            run_time = run_timer.stop()
+                with self.amp():
+                    out_hat = self.net(img)
+                    logits_hat = out_hat['logits']
+                    logits_lb_hat = logits_hat[:num_lb]
+                    _, logits_ulb_s_hat = logits_hat[num_lb:].chunk(2)
 
-            log_dict = {
-                'train/lb_loss': loss_lb.item(),
-                'train/sat_loss': loss_sat.item(),
-                'train/saf_loss': loss_saf.item(),
-                'train/total_loss': loss.item(),
-                'train/mask': 1 - mask.mean().item(),
-                'train/tau_t': self.tau_t.item(),
-                'train/p_t': self.p_t.mean().item(),
-                'train/label_hist': self.label_hist.mean().item(),
-                'train/label_hist_s': hist_p_ulb_s.mean().item(),
-                'train/lr': self.optim.optimizer.param_groups[0]['lr'],
-                'train/fetch_time': fetch_time,
-                'train/run_time': run_time,
-            }
-            log_dict.update(self.ncsam_stats)
+                    loss_lb = self.ce_criterion(logits_lb_hat, label_lb, reduction='mean')
+                    loss_sat, mask, self.tau_t, self.p_t, self.label_hist = self.sat_criterion(
+                        logits_ulb_w,
+                        logits_ulb_s_hat,
+                        self.tau_t,
+                        self.p_t,
+                        self.label_hist,
+                    )
+                    loss_saf, hist_p_ulb_s = self.saf_criterion(mask, logits_ulb_s_hat, self.p_t, self.label_hist)
+                    loss = loss_lb + self.ulb_loss_ratio * loss_sat + self.ent_loss_ratio * loss_saf
 
-            if (self.curr_iter + 1) % self.num_eval_iters == 0:
-                print('Evaluating...')
-                validate_dict = self.validate()
-                log_dict.update(validate_dict)
-                save_dir = osp.join(self.cfg.LOG_DIR, self.cfg.RUN_NAME, self.cfg.OUTPUT_DIR)
-                if not osp.exists(save_dir):
-                    os.makedirs(save_dir)
+                if self.cfg.TRAINER.AMP_ENABLED:
+                    self.scaler.scale(loss).backward()
+                    if flatmatch_warmup:
+                        with torch.no_grad():
+                            self.__remove_perturbation__(params, self.eps)
+                            self.__add_base_grads__(params, self.grad_w)
+                    else:
+                        self.scaler.unscale_(self.optim.optimizer)
+                        with torch.no_grad():
+                            self.__remove_perturbation__(params, self.eps)
+                            self.__add_base_grads__(params, self.grad_w)
+                    self.scaler.step(self.optim.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    with torch.no_grad():
+                        self.__remove_perturbation__(params, self.eps)
+                        self.__add_base_grads__(params, self.grad_w)
+                    self.optim.step()
 
-                improved = validate_dict['validation/accuracy'] > self.best_test_acc
-                if improved:
-                    self.best_test_acc = validate_dict['validation/accuracy']
-                    self.best_test_iter = self.curr_iter
-                    self.__save__model__(save_dir, 'best_checkpoint.pth')
+                self.sched.step()
+                self.net.update()
+                self.model.zero_grad()
 
-                self.__save__model__(save_dir, 'last_checkpoint.pth')
-                log_dict.update({
-                    'best_acc': self.best_test_acc,
-                    'best_iter': self.best_test_iter,
+                run_time = run_timer.stop()
+
+                log_dict = {
+                    'train/lb_loss': loss_lb.item(),
+                    'train/sat_loss': loss_sat.item(),
+                    'train/saf_loss': loss_saf.item(),
+                    'train/total_loss': loss.item(),
+                    'train/pseudo_accept_count': int(mask.sum().item()),
+                    'train/pseudo_total': int(mask.numel()),
+                    'train/pseudo_accept': mask.mean().item(),
+                    'train/pseudo_reject': 1 - mask.mean().item(),
+                    'train/tau_t': self.tau_t.item(),
+                    'train/p_t': self.p_t.mean().item(),
+                    'train/label_hist': self.label_hist.mean().item(),
+                    'train/label_hist_s': hist_p_ulb_s.mean().item(),
+                    'train/lr': self.optim.optimizer.param_groups[0]['lr'],
+                    'train/fetch_time': fetch_time,
+                    'train/run_time': run_time,
+                }
+                log_dict.update(self.ncsam_stats)
+
+                if (self.curr_iter + 1) % self.num_eval_iters == 0:
+                    print('Evaluating...')
+                    validate_dict = self.validate()
+                    log_dict.update(validate_dict)
+                    save_dir = osp.join(self.cfg.LOG_DIR, self.cfg.RUN_NAME, self.cfg.OUTPUT_DIR)
+                    if not osp.exists(save_dir):
+                        os.makedirs(save_dir)
+
+                    improved = validate_dict['validation/accuracy'] > self.best_test_acc
+                    if improved:
+                        self.best_test_acc = validate_dict['validation/accuracy']
+                        self.best_test_iter = self.curr_iter
+                        self.__save__model__(save_dir, 'best_checkpoint.pth')
+
+                    self.__save__model__(save_dir, 'last_checkpoint.pth')
+                    log_dict.update({
+                        'best_acc': self.best_test_acc,
+                        'best_iter': self.best_test_iter,
+                    })
+                    self._save_eval_result(log_dict, improved)
+                    self.tb.update(log_dict, self.curr_iter)
+
+                progress.set_postfix({
+                    'loss': '%.4f' % log_dict['train/total_loss'],
+                    'sat': '%.4f' % log_dict['train/sat_loss'],
+                    'mask': '%.3f' % log_dict['train/pseudo_accept'],
+                    'lambda': '%.3f' % log_dict['train/ncsam_lambda'],
+                    'flip': '%.3f' % log_dict['train/ncsam_selected_ratio'],
+                    'phase': 'fm' if flatmatch_warmup else 'ncsam',
+                    'best': '%.4f' % self.best_test_acc,
                 })
-                self._save_eval_result(log_dict, improved)
-                self.tb.update(log_dict, self.curr_iter)
+                progress.update(1)
 
-            if (self.curr_iter + 1) % self.num_log_iters == 0:
-                print('Iteration: %d / %d' % (self.curr_iter + 1, self.num_train_iters))
-                print('Fetch Time: %.3f, Run Time: %.3f' % (fetch_time, run_time))
-                pprint.pprint(log_dict, indent=4)
+                if (self.curr_iter + 1) % self.num_log_iters == 0:
+                    print('Iteration: %d / %d' % (self.curr_iter + 1, self.num_train_iters))
+                    print('Fetch Time: %.3f, Run Time: %.3f' % (fetch_time, run_time))
+                    pprint.pprint(log_dict, indent=4)
 
-            self.curr_iter += 1
-            del log_dict
-            batch_timer.start()
+                self.curr_iter += 1
+                del log_dict
+                batch_timer.start()
+        finally:
+            progress.close()
