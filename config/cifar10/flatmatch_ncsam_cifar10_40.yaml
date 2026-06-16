@@ -13,27 +13,49 @@ X_SHARP: True
 RHO: 0.05
 
 NCSAM:
+  # 是否启用 FlatMatch+NCSAM 噪声补偿；False 时不使用 NCSAM 补偿逻辑。
   ENABLED: True
+  # NCSAM 调度起始迭代；通常保持 0，通过 WARMUP_ITERS 控制前期过渡。
   START_ITER: 0
+  # 前期 warmup 迭代数；该阶段使用原始 FlatMatch，不启用 NCSAM 噪声补偿。
   WARMUP_ITERS: 10000
+  # 从 warmup 后开始，将 lambda 和噪声样本比例从最小值逐步升到最大值的迭代数。
   RAMP_ITERS: 20000
+  # 达到最大补偿强度后保持的迭代数；越长表示中期更久地维持 NCSAM 补偿。
   PLATEAU_ITERS: 50000
+  # 后期将 lambda 和噪声样本比例逐步降到 0 的迭代数。
   DECAY_ITERS: 20000
+  # ramp 初期的最小补偿强度；越小越保守。
   MIN_LAMBDA: 0.005
+  # 最大补偿强度；控制 eps_final = eps_fm - lambda * eps_noise 中扣除噪声方向的力度。
   MAX_LAMBDA: 0.05
+  # ramp 初期参与噪声 KL 估计的无标签样本比例。
   MIN_SELECT_RATIO: 0.1
+  # 最大参与噪声 KL 估计的无标签样本比例；越大补偿方向越受更多样本影响。
   SELECT_RATIO: 0.2
+  # 低置信度权重指数；越大越强调低置信伪标签样本。
   CONFIDENCE_POWER: 1.0
+  # weak-strong 分歧权重指数；越大越强调增强前后预测差异大的样本。
   DISAGREEMENT_POWER: 1.0
+  # 分歧权重下限；设为 0 表示完全一致的样本几乎不贡献噪声方向。
   MIN_DISAGREEMENT: 0.0
+  # hard disagreement 加权；weak/strong 预测类别不一致时额外增加噪声权重。
   HARD_DISAGREEMENT_WEIGHT: 0.5
+  # margin 不确定性温度；越小越偏向 top-1/top-2 margin 小的边界样本。
   MARGIN_TEMPERATURE: 1.0
+  # 批内特征密度权重指数；越大越偏向伪类别簇内更可靠的样本。
   DENSITY_POWER: 0.5
+  # 特征密度下限，避免低密度样本权重完全变成 0。
   MIN_DENSITY: 0.05
+  # 某个伪类别在 batch 中只有一个样本时使用的默认密度。
   SINGLETON_DENSITY: 0.5
+  # 类别先验中当前 batch 分布的权重；越大越依赖当前 batch，越小越依赖历史 label_hist。
   BATCH_PRIOR_WEIGHT: 0.3
+  # 类别均衡权重指数；越大越强调少数伪类别。
   CLASS_BALANCE_POWER: 1.0
+  # 类别均衡权重上限，防止少数类样本权重过大。
   MAX_BALANCE_WEIGHT: 2.0
+  # 单样本总权重上限，防止个别样本主导 eps_noise。
   MAX_SAMPLE_WEIGHT: 4.0
 
 DATASET:
