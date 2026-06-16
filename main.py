@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import os.path as osp
 from configs import CFG_default
+from flatmatch_ncsam_trainer import FlatMatchNCSAMTrainer
 from utils import setup_logger
 from trainer import FreeMatchTrainer
 from tester import FreeMatchTester
@@ -88,7 +89,10 @@ def main(args):
     
     print_configs(args, cfg)
     if not cfg.VALIDATE_ONLY:
-        trainer = FreeMatchTrainer(cfg)
+        if cfg.ALGORITHM == 'flatmatch_ncsam':
+            trainer = FlatMatchNCSAMTrainer(cfg)
+        else:
+            trainer = FreeMatchTrainer(cfg)
         trainer.train()
     else:
         tester = FreeMatchTester(cfg)

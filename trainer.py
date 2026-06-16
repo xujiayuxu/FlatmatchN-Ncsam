@@ -1,3 +1,5 @@
+import csv
+import json
 import torch
 import numpy as np
 import os.path as osp
@@ -98,6 +100,7 @@ class FreeMatchTrainer:
         self.curr_iter = 0
         self.best_test_iter = -1
         self.best_test_acc = -1
+        self.latest_eval_result = None
         self.p_t = torch.ones(cfg.DATASET.NUM_CLASSES) / cfg.DATASET.NUM_CLASSES
         self.label_hist = torch.ones(cfg.DATASET.NUM_CLASSES) / cfg.DATASET.NUM_CLASSES
         self.tau_t = self.p_t.mean()
@@ -124,6 +127,65 @@ class FreeMatchTrainer:
     def norm(self, tensor_list, p=2):
         """Compute p-norm for tensor list"""
         return torch.cat([x.flatten() for x in tensor_list if x is not None]).norm(p)
+
+    def _result_dir(self):
+        return osp.join(self.cfg.LOG_DIR, self.cfg.RUN_NAME, self.cfg.OUTPUT_DIR)
+
+    @staticmethod
+    def _to_plain_value(value):
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return value.detach().cpu().item()
+            return value.detach().cpu().tolist()
+        return value
+
+    def _method_config(self):
+        return {
+            'method': 'baseline_flatmatch' if self.x_sharp else 'baseline_freematch',
+            'rho': float(self.rho),
+            'x_sharp': bool(self.x_sharp),
+            'dataset': self.cfg.DATASET.NAME,
+            'num_labeled': int(self.cfg.DATASET.NUM_LABELED),
+            'seed': int(self.cfg.SEED),
+        }
+
+    def _save_eval_result(self, log_dict, improved):
+        save_dir = self._result_dir()
+        if not osp.exists(save_dir):
+            os.makedirs(save_dir)
+
+        result = {
+            'iteration': int(self.curr_iter + 1),
+            'best_iter': int(self.best_test_iter),
+            'best_acc': float(self.best_test_acc),
+            'improved': bool(improved),
+        }
+        result.update(self._method_config())
+        result.update({key: self._to_plain_value(value) for key, value in log_dict.items()})
+        self.latest_eval_result = result
+
+        csv_path = osp.join(save_dir, 'eval_history.csv')
+        jsonl_path = osp.join(save_dir, 'eval_history.jsonl')
+        latest_path = osp.join(save_dir, 'latest_result.json')
+        best_path = osp.join(save_dir, 'best_result.json')
+
+        fieldnames = sorted(result.keys())
+        write_header = not osp.exists(csv_path)
+        with open(csv_path, 'a', newline='') as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({key: result.get(key) for key in fieldnames})
+
+        with open(jsonl_path, 'a') as jsonl_file:
+            jsonl_file.write(json.dumps(result, sort_keys=True) + '\n')
+
+        with open(latest_path, 'w') as latest_file:
+            json.dump(result, latest_file, indent=2, sort_keys=True)
+
+        if improved:
+            with open(best_path, 'w') as best_file:
+                json.dump(result, best_file, indent=2, sort_keys=True)
         
     def warmup_train(self):
         
@@ -330,7 +392,8 @@ class FreeMatchTrainer:
                 if not osp.exists(save_dir):
                     os.makedirs(save_dir)
                     
-                if validate_dict['validation/accuracy'] > self.best_test_acc:
+                improved = validate_dict['validation/accuracy'] > self.best_test_acc
+                if improved:
                     self.best_test_acc = validate_dict['validation/accuracy']
                     self.best_test_iter = self.curr_iter
                     self.__save__model__(save_dir, 'best_checkpoint.pth')
@@ -343,6 +406,7 @@ class FreeMatchTrainer:
                                 'best_iter': self.best_test_iter
                             }
                 )
+                self._save_eval_result(log_dict, improved)
                 self.tb.update(log_dict, self.curr_iter)
                 
             if (self.curr_iter + 1) % self.num_log_iters == 0:
