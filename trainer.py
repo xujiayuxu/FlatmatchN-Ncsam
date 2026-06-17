@@ -336,16 +336,21 @@ class FreeMatchTrainer:
         if self.cfg.TRAINER.AMP_ENABLED:
             self.scaler.scale(loss).backward()
             if self.x_sharp:
-                self.scaler.unscale_(self.optim.optimizer)
                 with torch.no_grad():
-                    self._restore_perturbation_and_add_base_grads(params, self.eps, self.grad_w)
+                    for p, v, g in zip(params, self.eps, self.grad_w):
+                        if v is not None:
+                            p.sub_(v)
+                            p.grad += g
             self.scaler.step(self.optim.optimizer)
             self.scaler.update()
         else:
             loss.backward()
             if self.x_sharp:
                 with torch.no_grad():
-                    self._restore_perturbation_and_add_base_grads(params, self.eps, self.grad_w)
+                    for p, v, g in zip(params, self.eps, self.grad_w):
+                        if v is not None:
+                            p.sub_(v)
+                            p.grad += g
             self.optim.step()
 
         self.sched.step()

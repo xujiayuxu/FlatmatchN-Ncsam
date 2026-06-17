@@ -1,4 +1,4 @@
-RUN_NAME: 'flatmatch_ncsam_cifar10_40_V3'
+RUN_NAME: 'flatmatch_ncsam_cifar10_40_V4'
 ALGORITHM: 'flatmatch_ncsam'
 OUTPUT_DIR: 'model_ckpt'
 CONT_TRAIN: False
