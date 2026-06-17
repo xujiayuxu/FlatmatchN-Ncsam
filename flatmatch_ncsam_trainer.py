@@ -249,11 +249,12 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
         warmup_end = self.ncsam_cfg.START_ITER + self.ncsam_cfg.WARMUP_ITERS
         return self.curr_iter < warmup_end
 
-    def __build_flatmatch_perturbation__(self, loss_lb):
-        grad_w = torch.autograd.grad(loss_lb, self.net.model.parameters(), allow_unused=True)
-        eps_fm, _ = self.__normalize_grads__(grad_w, self.rho)
-        self.ncsam_stats = self.__empty_ncsam_stats__()
-        return grad_w, eps_fm
+    def __use_plain_flatmatch_step__(self):
+        if not self.ncsam_cfg.ENABLED:
+            return True
+        if self.__use_flatmatch_warmup__():
+            return True
+        return self.__compensation_lambda__() <= 0.0
 
     def __build_compensated_perturbation__(self, loss_lb, logits_ulb_w, logits_ulb_s, feats_ulb_w):
         params = list(self.net.model.parameters())
@@ -292,22 +293,6 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
             if eps is not None:
                 param.add_(eps)
 
-    @staticmethod
-    def __remove_perturbation__(params, perturbation):
-        for param, eps in zip(params, perturbation):
-            if eps is not None:
-                param.sub_(eps)
-
-    @staticmethod
-    def __add_base_grads__(params, grads):
-        for param, grad in zip(params, grads):
-            if grad is None:
-                continue
-            if param.grad is None:
-                param.grad = grad.detach().clone()
-            else:
-                param.grad.add_(grad.detach())
-
     def train(self):
         print('Starting FlatMatch+NCSAM model training...')
 
@@ -330,6 +315,58 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
                 fetch_time = batch_timer.stop()
                 run_timer.start()
 
+                if self.__use_plain_flatmatch_step__():
+                    log_dict = self._train_flatmatch_batch(batch_lb, batch_ulb)
+                    self.ncsam_stats = self.__empty_ncsam_stats__()
+                    log_dict.update(self.ncsam_stats)
+
+                    run_time = run_timer.stop()
+                    log_dict['train/fetch_time'] = fetch_time
+                    log_dict['train/run_time'] = run_time
+
+                    if (self.curr_iter + 1) % self.num_eval_iters == 0:
+                        print('Evaluating...')
+                        validate_dict = self.validate()
+                        log_dict.update(validate_dict)
+                        save_dir = osp.join(self.cfg.LOG_DIR, self.cfg.RUN_NAME, self.cfg.OUTPUT_DIR)
+                        if not osp.exists(save_dir):
+                            os.makedirs(save_dir)
+
+                        improved = validate_dict['validation/accuracy'] > self.best_test_acc
+                        if improved:
+                            self.best_test_acc = validate_dict['validation/accuracy']
+                            self.best_test_iter = self.curr_iter
+                            self.__save__model__(save_dir, 'best_checkpoint.pth')
+
+                        self.__save__model__(save_dir, 'last_checkpoint.pth')
+                        log_dict.update({
+                            'best_acc': self.best_test_acc,
+                            'best_iter': self.best_test_iter,
+                        })
+                        self._save_eval_result(log_dict, improved)
+                        self.tb.update(log_dict, self.curr_iter)
+
+                    progress.set_postfix({
+                        'loss': '%.4f' % log_dict['train/total_loss'],
+                        'sat': '%.4f' % log_dict['train/sat_loss'],
+                        'mask': '%.3f' % log_dict['train/pseudo_accept'],
+                        'lambda': '%.3f' % log_dict['train/ncsam_lambda'],
+                        'noise': '%.3f' % log_dict['train/ncsam_selected_ratio'],
+                        'phase': 'fm',
+                        'best': '%.4f' % self.best_test_acc,
+                    })
+                    progress.update(1)
+
+                    if (self.curr_iter + 1) % self.num_log_iters == 0:
+                        print('Iteration: %d / %d' % (self.curr_iter + 1, self.num_train_iters))
+                        print('Fetch Time: %.3f, Run Time: %.3f' % (fetch_time, run_time))
+                        pprint.pprint(log_dict, indent=4)
+
+                    self.curr_iter += 1
+                    del log_dict
+                    batch_timer.start()
+                    continue
+
                 img_lb_w, label_lb = batch_lb['img_w'], batch_lb['label']
                 img_ulb_w, img_ulb_s = batch_ulb['img_w'], batch_ulb['img_s']
 
@@ -342,7 +379,6 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
 
                 img = torch.cat([img_lb_w, img_ulb_w, img_ulb_s])
                 params = list(self.net.model.parameters())
-                flatmatch_warmup = self.__use_flatmatch_warmup__()
 
                 with self.amp():
                     enable_running_stats(self.net.model)
@@ -354,15 +390,12 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
                     feats_ulb_w = feats[num_lb:num_lb + num_ulb]
 
                     loss_lb = self.ce_criterion(logits_lb, label_lb, reduction='mean')
-                    if flatmatch_warmup:
-                        self.grad_w, self.eps = self.__build_flatmatch_perturbation__(loss_lb)
-                    else:
-                        self.grad_w, self.eps = self.__build_compensated_perturbation__(
-                            loss_lb,
-                            logits_ulb_w,
-                            logits_ulb_s,
-                            feats_ulb_w,
-                        )
+                    self.grad_w, self.eps = self.__build_compensated_perturbation__(
+                        loss_lb,
+                        logits_ulb_w,
+                        logits_ulb_s,
+                        feats_ulb_w,
+                    )
 
                 with torch.no_grad():
                     self.__add_perturbation__(params, self.eps)
@@ -388,22 +421,15 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
 
                 if self.cfg.TRAINER.AMP_ENABLED:
                     self.scaler.scale(loss).backward()
-                    if flatmatch_warmup:
-                        with torch.no_grad():
-                            self.__remove_perturbation__(params, self.eps)
-                            self.__add_base_grads__(params, self.grad_w)
-                    else:
-                        self.scaler.unscale_(self.optim.optimizer)
-                        with torch.no_grad():
-                            self.__remove_perturbation__(params, self.eps)
-                            self.__add_base_grads__(params, self.grad_w)
+                    self.scaler.unscale_(self.optim.optimizer)
+                    with torch.no_grad():
+                        self._restore_perturbation_and_add_base_grads(params, self.eps, self.grad_w)
                     self.scaler.step(self.optim.optimizer)
                     self.scaler.update()
                 else:
                     loss.backward()
                     with torch.no_grad():
-                        self.__remove_perturbation__(params, self.eps)
-                        self.__add_base_grads__(params, self.grad_w)
+                        self._restore_perturbation_and_add_base_grads(params, self.eps, self.grad_w)
                     self.optim.step()
 
                 self.sched.step()
@@ -417,6 +443,7 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
                     'train/sat_loss': loss_sat.item(),
                     'train/saf_loss': loss_saf.item(),
                     'train/total_loss': loss.item(),
+                    'train/mask': 1 - mask.mean().item(),
                     'train/pseudo_accept_count': int(mask.sum().item()),
                     'train/pseudo_total': int(mask.numel()),
                     'train/pseudo_accept': mask.mean().item(),
@@ -459,7 +486,7 @@ class FlatMatchNCSAMTrainer(FreeMatchTrainer):
                     'mask': '%.3f' % log_dict['train/pseudo_accept'],
                     'lambda': '%.3f' % log_dict['train/ncsam_lambda'],
                     'noise': '%.3f' % log_dict['train/ncsam_selected_ratio'],
-                    'phase': 'fm' if flatmatch_warmup else 'ncsam',
+                    'phase': 'ncsam',
                     'best': '%.4f' % self.best_test_acc,
                 })
                 progress.update(1)

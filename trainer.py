@@ -128,6 +128,18 @@ class FreeMatchTrainer:
         """Compute p-norm for tensor list"""
         return torch.cat([x.flatten() for x in tensor_list if x is not None]).norm(p)
 
+    @staticmethod
+    def _restore_perturbation_and_add_base_grads(params, perturbation, grads):
+        for param, eps, grad in zip(params, perturbation, grads):
+            if eps is not None:
+                param.sub_(eps)
+            if grad is None:
+                continue
+            if param.grad is None:
+                param.grad = grad.detach().clone()
+            else:
+                param.grad.add_(grad.detach())
+
     def _result_dir(self):
         return osp.join(self.cfg.LOG_DIR, self.cfg.RUN_NAME, self.cfg.OUTPUT_DIR)
 
@@ -261,6 +273,103 @@ class FreeMatchTrainer:
             label_hist = torch.bincount(max_idx, minlength=probs.shape[1]).to(probs.dtype) 
             self.label_hist = label_hist / label_hist.sum()
 
+    def _train_flatmatch_batch(self, batch_lb, batch_ulb):
+        img_lb_w, label_lb = batch_lb['img_w'], batch_lb['label']
+        img_ulb_w, img_ulb_s = batch_ulb['img_w'], batch_ulb['img_s']
+
+        img_lb_w, label_lb = img_lb_w.to(self.device), label_lb.to(self.device)
+        img_ulb_w, img_ulb_s = img_ulb_w.to(self.device), img_ulb_s.to(self.device)
+
+        num_lb = img_lb_w.shape[0]
+        num_ulb = img_ulb_w.shape[0]
+
+        assert num_ulb == img_ulb_s.shape[0]
+
+        img = torch.cat([img_lb_w, img_ulb_w, img_ulb_s])
+        params = list(self.net.model.parameters())
+        with self.amp():
+            if self.x_sharp:
+                enable_running_stats(self.net.model)
+            out = self.net(img)
+            logits = out['logits']
+            logits_lb = logits[:num_lb]
+            logits_ulb_w, logits_ulb_s = logits[num_lb:].chunk(2)
+
+            loss_lb = self.ce_criterion(logits_lb, label_lb, reduction='mean')
+
+            if not self.x_sharp:
+                loss_sat, mask, self.tau_t, self.p_t, self.label_hist = self.sat_criterion(
+                    logits_ulb_w, logits_ulb_s, self.tau_t, self.p_t, self.label_hist
+                )
+
+                loss_saf, hist_p_ulb_s = self.saf_criterion(mask, logits_ulb_s, self.p_t, self.label_hist)
+                loss = loss_lb + self.ulb_loss_ratio * loss_sat + self.ent_loss_ratio * loss_saf
+
+            else:
+                with torch.no_grad():
+                    self.grad_w = torch.autograd.grad(loss_lb, params, allow_unused=True)
+                    scale = self.rho / self.norm(self.grad_w)
+                    self.eps = [g * scale if g is not None else None for g in self.grad_w]
+
+                    # model perturbation
+                    for p, v in zip(params, self.eps):
+                        if v is not None:
+                            p.add_(v)
+
+                # second propagation step
+                disable_running_stats(self.net.model)
+
+                out_hat = self.net(img)
+                logits_hat = out_hat['logits']
+                logits_lb_hat = logits_hat[:num_lb]
+                logits_ulb_w_hat, logits_ulb_s_hat = logits_hat[num_lb:].chunk(2)
+
+                loss_lb = self.ce_criterion(logits_lb_hat, label_lb, reduction='mean')
+
+                loss_sat, mask, self.tau_t, self.p_t, self.label_hist = self.sat_criterion(
+                    logits_ulb_w, logits_ulb_s_hat, self.tau_t, self.p_t, self.label_hist)
+
+                loss_saf, hist_p_ulb_s = self.saf_criterion(mask, logits_ulb_s_hat, self.p_t, self.label_hist)
+
+                loss = loss_lb + self.ulb_loss_ratio * loss_sat + self.ent_loss_ratio * loss_saf
+
+        if self.cfg.TRAINER.AMP_ENABLED:
+            self.scaler.scale(loss).backward()
+            if self.x_sharp:
+                self.scaler.unscale_(self.optim.optimizer)
+                with torch.no_grad():
+                    self._restore_perturbation_and_add_base_grads(params, self.eps, self.grad_w)
+            self.scaler.step(self.optim.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            if self.x_sharp:
+                with torch.no_grad():
+                    self._restore_perturbation_and_add_base_grads(params, self.eps, self.grad_w)
+            self.optim.step()
+
+        self.sched.step()
+        self.net.update()
+        self.model.zero_grad()
+
+        mask_mean = mask.mean().item()
+        return {
+            'train/lb_loss': loss_lb.item(),
+            'train/sat_loss': loss_sat.item(),
+            'train/saf_loss': loss_saf.item(),
+            'train/total_loss': loss.item(),
+            'train/mask': 1 - mask_mean,
+            'train/pseudo_accept_count': int(mask.sum().item()),
+            'train/pseudo_total': int(mask.numel()),
+            'train/pseudo_accept': mask_mean,
+            'train/pseudo_reject': 1 - mask_mean,
+            'train/tau_t': self.tau_t.item(),
+            'train/p_t': self.p_t.mean().item(),
+            'train/label_hist': self.label_hist.mean().item(),
+            'train/label_hist_s': hist_p_ulb_s.mean().item(),
+            'train/lr': self.optim.optimizer.param_groups[0]['lr']
+        }
+
     def train(self):
     
         print('Starting model training...')
@@ -283,105 +392,11 @@ class FreeMatchTrainer:
             end_batch.record()
             torch.cuda.synchronize()
             start_run.record()
-            
-            img_lb_w, label_lb = batch_lb['img_w'], batch_lb['label']
-            img_ulb_w, img_ulb_s = batch_ulb['img_w'], batch_ulb['img_s']
-            
-            img_lb_w, label_lb = img_lb_w.to(self.device), label_lb.to(self.device) 
-            img_ulb_w, img_ulb_s = img_ulb_w.to(self.device), img_ulb_s.to(self.device)
-            
-            num_lb = img_lb_w.shape[0]
-            num_ulb = img_ulb_w.shape[0]
-            
-            assert num_ulb == img_ulb_s.shape[0]
-            
-            img = torch.cat([img_lb_w, img_ulb_w, img_ulb_s])
-            with self.amp():
-                if self.x_sharp:
-                    enable_running_stats(self.net.model)
-                out = self.net(img)    
-                logits = out['logits']
-                logits_lb = logits[:num_lb]
-                logits_ulb_w, logits_ulb_s = logits[num_lb:].chunk(2)
 
-                loss_lb = self.ce_criterion(logits_lb, label_lb, reduction='mean')
-                
-                if not self.x_sharp:
-                    loss_sat, mask, self.tau_t, self.p_t, self.label_hist = self.sat_criterion(
-                        logits_ulb_w, logits_ulb_s, self.tau_t, self.p_t, self.label_hist
-                    )
-
-                    loss_saf, hist_p_ulb_s = self.saf_criterion(mask, logits_ulb_s, self.p_t, self.label_hist) 
-                    loss = loss_lb + self.ulb_loss_ratio * loss_sat + self.ent_loss_ratio * loss_saf
-
-                else:
-                    with torch.no_grad():
-                        self.grad_w = torch.autograd.grad(loss_lb, self.net.model.parameters(), allow_unused=True)
-                        scale = self.rho / self.norm(self.grad_w)
-                        self.eps = [g * scale if g is not None else None for g in self.grad_w]
-
-                        # model perturbation
-                        for p, v in zip(self.net.model.parameters(), self.eps):
-                            if v is not None:
-                                p.add_(v)
-
-                    # second propagation step
-                    disable_running_stats(self.net.model)
-
-                    out_hat = self.net(img)
-                    logits_hat = out_hat['logits']
-                    logits_lb_hat = logits_hat[:num_lb]
-                    logits_ulb_w_hat, logits_ulb_s_hat = logits_hat[num_lb:].chunk(2)
-
-                    loss_lb = self.ce_criterion(logits_lb_hat, label_lb, reduction='mean')
-
-                    loss_sat, mask, self.tau_t, self.p_t, self.label_hist = self.sat_criterion(
-                        logits_ulb_w, logits_ulb_s_hat, self.tau_t, self.p_t, self.label_hist)
-
-                    loss_saf, hist_p_ulb_s = self.saf_criterion(mask, logits_ulb_s_hat, self.p_t, self.label_hist) 
-
-                    loss = loss_lb + self.ulb_loss_ratio * loss_sat + self.ent_loss_ratio * loss_saf
-
-            if self.cfg.TRAINER.AMP_ENABLED:
-                self.scaler.scale(loss).backward()
-                if self.x_sharp:
-                    with torch.no_grad():
-                        for p, v, g in zip(self.net.model.parameters(), self.eps, self.grad_w):
-                            if v is not None:
-                                p.sub_(v)
-                                p.grad += g
-                self.scaler.step(self.optim.optimizer)
-                self.scaler.update()
-            else:
-                loss.backward()
-                if self.x_sharp:
-                    with torch.no_grad():
-                        for p, v, g in zip(self.net.model.parameters(), self.eps, self.grad_w):
-                            if v is not None:
-                                p.sub_(v)
-                                p.grad += g
-                self.optim.step()
-            
-            self.sched.step()
-            self.net.update()
-            self.model.zero_grad()
+            log_dict = self._train_flatmatch_batch(batch_lb, batch_ulb)
 
             end_run.record()
             torch.cuda.synchronize()
-            
-            # Logging in tensorboard
-            log_dict = {
-                'train/lb_loss': loss_lb.item(),
-                'train/sat_loss': loss_sat.item(),
-                'train/saf_loss': loss_saf.item(),
-                'train/total_loss': loss.item(),
-                'train/mask': 1 - mask.mean().item(),
-                'train/tau_t': self.tau_t.item(),
-                'train/p_t': self.p_t.mean().item(),
-                'train/label_hist': self.label_hist.mean().item(),
-                'train/label_hist_s': hist_p_ulb_s.mean().item(),
-                'train/lr': self.optim.optimizer.param_groups[0]['lr']
-            } 
             
             if (self.curr_iter + 1) % self.num_eval_iters == 0:
                 

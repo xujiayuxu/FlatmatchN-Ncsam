@@ -1,4 +1,4 @@
-RUN_NAME: 'flatmatch_ncsam_cifar10_40_V1'
+RUN_NAME: 'flatmatch_ncsam_cifar10_40_V3'
 ALGORITHM: 'flatmatch_ncsam'
 OUTPUT_DIR: 'model_ckpt'
 CONT_TRAIN: False
@@ -26,9 +26,9 @@ NCSAM:
   # 后期将 lambda 和噪声样本比例逐步降到 0 的迭代数。
   DECAY_ITERS: 20000
   # ramp 初期的最小补偿强度；越小越保守。
-  MIN_LAMBDA: 0.005
+  MIN_LAMBDA: 0.01
   # 最大补偿强度；控制 eps_final = eps_fm - lambda * eps_noise 中扣除噪声方向的力度。
-  MAX_LAMBDA: 0.05
+  MAX_LAMBDA: 0.1
   # ramp 初期参与噪声 KL 估计的无标签样本比例。
   MIN_SELECT_RATIO: 0.1
   # 最大参与噪声 KL 估计的无标签样本比例；越大补偿方向越受更多样本影响。
@@ -56,7 +56,7 @@ NCSAM:
   # 类别均衡权重上限，防止少数类样本权重过大。
   MAX_BALANCE_WEIGHT: 2.0
   # 单样本总权重上限，防止个别样本主导 eps_noise。
-  MAX_SAMPLE_WEIGHT: 4.0
+  MAX_SAMPLE_WEIGHT: 3.0
 
 DATASET:
   PREPARE: False
